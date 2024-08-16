@@ -1,6 +1,6 @@
 {
   "name": "potree-core-haxer",
-  "version": "2.0.10",
+  "version": "2.0.11",
   "description": "Potree wrapper for three.js applications",
   "repository": {
     "type": "git",
