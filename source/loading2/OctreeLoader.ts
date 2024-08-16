@@ -1,10 +1,13 @@
-import {XhrRequest} from './../loading/types';
+import {XhrRequest} from '../loading';
 import {BufferAttribute, BufferGeometry, Vector3} from 'three';
 import {PointAttribute, PointAttributes, PointAttributeTypes} from './PointAttributes';
 import {Box3, Sphere} from 'three';
 import {WorkerPool, WorkerType} from './WorkerPool';
 import {OctreeGeometryNode} from './OctreeGeometryNode';
 import {OctreeGeometry} from './OctreeGeometry';
+import {BrotliDecoder} from "./BrotliDecoder";
+import {isBrowser} from "../utils/utils";
+import {Decoder} from "./Decoder";
 
 export class NodeLoader
 {
@@ -16,15 +19,11 @@ export class NodeLoader
 	offset?: [number, number, number];
 	
 
-	constructor(public url: string, public workerPool: WorkerPool, public metadata: Metadata)
-	{
-	}
+	constructor(public url: string, public workerPool: WorkerPool, public metadata: Metadata) {}
 
-	async load(node: OctreeGeometryNode)
-	{
+	async load(node: OctreeGeometryNode) {
 
-		if (node.loaded || node.loading)
-		{
+		if (node.loaded || node.loading) {
 			return;
 		}
 
@@ -32,17 +31,14 @@ export class NodeLoader
 		// TODO: Need to put the numNodesLoading to the pco
 		node.octreeGeometry.numNodesLoading++;
 
-		try 
-		{
-			if (node.nodeType === 2)
-			{ // TODO: Investigate
+		try {
+			if (node.nodeType === 2) { // TODO: Investigate
 				await this.loadHierarchy(node);
 			}
 
 			let {byteOffset, byteSize} = node;
 			
-			if (byteOffset === undefined || byteSize === undefined) 
-			{
+			if (byteOffset === undefined || byteSize === undefined) {
 				throw new Error('byteOffset and byteSize are required');
 			}
 
@@ -53,14 +49,11 @@ export class NodeLoader
 
 			let buffer;
 
-			if (byteSize === BigInt(0))
-			{
+			if (byteSize === BigInt(0)) {
 				buffer = new ArrayBuffer(0);
 				console.warn(`loaded node with 0 bytes: ${node.name}`);
-			}
-			else 
-			{
-				let response = await fetch(urlOctree, {
+			} else {
+				const response = await fetch(urlOctree, {
 					headers: {
 						'content-type': 'multipart/byteranges',
 						'Range': `bytes=${first}-${last}`
@@ -70,45 +63,110 @@ export class NodeLoader
 				buffer = await response.arrayBuffer();
 			}
 
-			const workerType = this.metadata.encoding === 'BROTLI' ? WorkerType.DECODER_WORKER_BROTLI : WorkerType.DECODER_WORKER;
-			const worker = this.workerPool.getWorker(workerType);
+			let box = node.boundingBox;
+			let min = node.octreeGeometry.offset.clone().add(box.min);
+			let size = box.max.clone().sub(box.min);
+			let max = min.clone().add(size);
 
-			worker.onmessage = (e) => 
-			{
+			let message = {
+				name: node.name,
+				buffer: buffer,
+				pointAttributes: node.octreeGeometry.pointAttributes,
+				scale: node.octreeGeometry.scale,
+				min: min,
+				max: max,
+				size: size,
+				offset: node.octreeGeometry.loader.offset,
+				numPoints: node.numPoints
+			};
 
-				let data = e.data;
-				let buffers = data.attributeBuffers;
+			if (isBrowser()) {
+				const workerType = this.metadata.encoding === 'BROTLI' ? WorkerType.DECODER_WORKER_BROTLI : WorkerType.DECODER_WORKER;
+				const worker = this.workerPool.getWorker(workerType);
+				worker.onmessage = (e) => {
 
-				this.workerPool.returnWorker(workerType, worker);
+					let data = e.data;
+					let buffers = data.attributeBuffers;
 
-				let geometry = new BufferGeometry();
-				
-				for (let property in buffers)
-				{
+					this.workerPool.returnWorker(workerType, worker);
 
-					let buffer = buffers[property].buffer;
+					let geometry = new BufferGeometry();
 
-					if (property === 'position')
+					for (let property in buffers)
 					{
+
+						let buffer = buffers[property].buffer;
+
+						if (property === 'position')
+						{
+							geometry.setAttribute('position', new BufferAttribute(new Float32Array(buffer), 3));
+						}
+						else if (property === 'rgba')
+						{
+							geometry.setAttribute('rgba', new BufferAttribute(new Uint8Array(buffer), 4, true));
+						}
+						else if (property === 'NORMAL')
+						{
+							// geometry.setAttribute('rgba', new BufferAttribute(new Uint8Array(buffer), 4, true));
+							geometry.setAttribute('normal', new BufferAttribute(new Float32Array(buffer), 3));
+						}
+						else if (property === 'INDICES')
+						{
+							let bufferAttribute = new BufferAttribute(new Uint8Array(buffer), 4);
+							bufferAttribute.normalized = true;
+							geometry.setAttribute('indices', bufferAttribute);
+						}
+						else
+						{
+							const bufferAttribute: BufferAttribute & {
+								potree?: object
+							} = new BufferAttribute(new Float32Array(buffer), 1);
+
+							let batchAttribute = buffers[property].attribute;
+							bufferAttribute.potree = {
+								offset: buffers[property].offset,
+								scale: buffers[property].scale,
+								preciseBuffer: buffers[property].preciseBuffer,
+								range: batchAttribute.range
+							};
+
+							geometry.setAttribute(property, bufferAttribute);
+						}
+
+					}
+					// indices ??
+
+					node.density = data.density;
+					node.geometry = geometry;
+					node.loaded = true;
+					node.loading = false;
+					// Potree.numNodesLoading--;
+					node.octreeGeometry.numNodesLoading--;
+				};
+
+				worker.postMessage(message, [message.buffer]);
+			} else {
+				const decoder = this.metadata.encoding === 'BROTLI' ? new BrotliDecoder() : new Decoder()
+				const data = decoder.decode(message)
+				const buffers = data.attributeBuffers
+
+				const geometry = new BufferGeometry();
+
+				for (let property in buffers) {
+					const buffer = buffers[property].buffer;
+
+					if (property === 'position') {
 						geometry.setAttribute('position', new BufferAttribute(new Float32Array(buffer), 3));
-					}
-					else if (property === 'rgba')
-					{
+					} else if (property === 'rgba') {
 						geometry.setAttribute('rgba', new BufferAttribute(new Uint8Array(buffer), 4, true));
-					}
-					else if (property === 'NORMAL')
-					{
+					} else if (property === 'NORMAL') {
 						// geometry.setAttribute('rgba', new BufferAttribute(new Uint8Array(buffer), 4, true));
 						geometry.setAttribute('normal', new BufferAttribute(new Float32Array(buffer), 3));
-					}
-					else if (property === 'INDICES') 
-					{
+					} else if (property === 'INDICES') {
 						let bufferAttribute = new BufferAttribute(new Uint8Array(buffer), 4);
 						bufferAttribute.normalized = true;
 						geometry.setAttribute('indices', bufferAttribute);
-					}
-					else 
-					{
+					} else {
 						const bufferAttribute: BufferAttribute & {
 							potree?: object
 						} = new BufferAttribute(new Float32Array(buffer), 1);
@@ -125,7 +183,6 @@ export class NodeLoader
 					}
 
 				}
-				// indices ??
 
 				node.density = data.density;
 				node.geometry = geometry;
@@ -133,42 +190,14 @@ export class NodeLoader
 				node.loading = false;
 				// Potree.numNodesLoading--;
 				node.octreeGeometry.numNodesLoading--;
-			};
 
-			let pointAttributes = node.octreeGeometry.pointAttributes;
-			let scale = node.octreeGeometry.scale;
+			}
 
-			let box = node.boundingBox;
-			let min = node.octreeGeometry.offset.clone().add(box.min);
-			let size = box.max.clone().sub(box.min);
-			let max = min.clone().add(size);
-			let numPoints = node.numPoints;
 
-			let offset = node.octreeGeometry.loader.offset;
-
-			let message = {
-				name: node.name,
-				buffer: buffer,
-				pointAttributes: pointAttributes,
-				scale: scale,
-				min: min,
-				max: max,
-				size: size,
-				offset: offset,
-				numPoints: numPoints
-			};
-
-			worker.postMessage(message, [message.buffer]);
-		}
-		catch (e)
-		{
+		} catch (e) {
 			node.loaded = false;
 			node.loading = false;
 			node.octreeGeometry.numNodesLoading--;
-
-			// console.log(`failed to load ${node.name}`);
-			// console.log(e);
-			// console.log(`trying again!`);
 		}
 	}
 
